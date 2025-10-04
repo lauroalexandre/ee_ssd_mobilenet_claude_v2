@@ -1,0 +1,12 @@
+{
+    "final_train_loss": 0.0876837535802275,
+    "final_early_loss": 0.1593652002647519,
+    "final_full_loss": 2.271810841421029e-08,
+    "final_early_exit_rate": 0.07586206896551724,
+    "final_inference_time": 14.200721938034583,
+    "avg_confidence": 0.7329337162494659,
+    "confidence_std": 0.14707208747640252,
+    "final_temperature": 0.12962238490581512,
+    "early_count": 11,
+    "full_count": 134
+}
