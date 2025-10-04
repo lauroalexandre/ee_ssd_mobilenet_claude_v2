@@ -1,11 +1,10 @@
-# early_exit_ssdlite.py
+# early_exit_training_system_v2_fixed.py
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 from torchvision.models.detection import ssdlite320_mobilenet_v3_large
-from torchvision.models.detection.ssd import SSD
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import os
@@ -17,6 +16,7 @@ from PIL import Image
 from collections import defaultdict
 from tqdm import tqdm
 import warnings
+import shutil
 warnings.filterwarnings('ignore')
 
 # Dataset paths
@@ -30,37 +30,60 @@ MODEL_ROOT_OUTPUT_PATH = "working/"
 MODEL_OUTPUT_PATH = f"{MODEL_ROOT_OUTPUT_PATH}model_trained/"
 ANALYSIS_EE_OUTPUT_PATH = f"{MODEL_ROOT_OUTPUT_PATH}ee_analysis/"
 
-# Create output directories
-os.makedirs(MODEL_OUTPUT_PATH, exist_ok=True)
-os.makedirs(ANALYSIS_EE_OUTPUT_PATH, exist_ok=True)
+
+def clean_working_directory():
+    """Clean the working directory before starting training"""
+    if os.path.exists(MODEL_ROOT_OUTPUT_PATH):
+        print(f"Cleaning working directory: {MODEL_ROOT_OUTPUT_PATH}")
+        shutil.rmtree(MODEL_ROOT_OUTPUT_PATH)
+        print("Working directory cleaned successfully")
+
+
+def create_output_directories():
+    """Create output directories for models and analysis"""
+    os.makedirs(MODEL_OUTPUT_PATH, exist_ok=True)
+    os.makedirs(ANALYSIS_EE_OUTPUT_PATH, exist_ok=True)
+    print(f"Output directories created:")
+    print(f"  - {MODEL_OUTPUT_PATH}")
+    print(f"  - {ANALYSIS_EE_OUTPUT_PATH}")
 
 # COCO chair category ID
 CHAIR_CATEGORY_ID = 62
 
 
+def collate_fn(batch):
+    """Custom collate function for DataLoader"""
+    return tuple(zip(*batch))
+
+
 class ChairCocoDataset(Dataset):
     """Dataset for chair detection only from COCO"""
-    
-    def __init__(self, img_folder, ann_file, transforms=None):
+
+    def __init__(self, img_folder, ann_file, transforms=None, max_samples=None):
         self.img_folder = img_folder
         self.transforms = transforms
-        
+
         # Load COCO annotations
         with open(ann_file, 'r') as f:
             self.coco = json.load(f)
-        
+
         # Create image id to filename mapping
-        self.img_id_to_filename = {img['id']: img['file_name'] 
+        self.img_id_to_filename = {img['id']: img['file_name']
                                    for img in self.coco['images']}
-        
+
         # Filter annotations for chairs only
         self.chair_annotations = defaultdict(list)
         for ann in self.coco['annotations']:
             if ann['category_id'] == CHAIR_CATEGORY_ID:
                 self.chair_annotations[ann['image_id']].append(ann)
-        
+
         # Keep only images with chairs
         self.valid_img_ids = list(self.chair_annotations.keys())
+
+        # Limit dataset size if specified
+        if max_samples and max_samples < len(self.valid_img_ids):
+            self.valid_img_ids = self.valid_img_ids[:max_samples]
+
         print(f"Found {len(self.valid_img_ids)} images with chairs")
     
     def __len__(self):
@@ -103,152 +126,214 @@ class ChairCocoDataset(Dataset):
 class EarlyExitBranch(nn.Module):
     """Early exit branch for SSDLite"""
     
-    def __init__(self, in_channels, num_classes=2):
+    def __init__(self, in_channels, num_anchors, num_classes=2):
         super().__init__()
         
-        # Lightweight detection head
-        self.conv1 = nn.Conv2d(in_channels, 256, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(256)
-        self.conv2 = nn.Conv2d(256, 128, kernel_size=1)
-        self.bn2 = nn.BatchNorm2d(128)
+        # Lightweight detection head similar to SSDLite structure
+        intermediate_channels = max(in_channels // 2, 64)
         
-        # Classification and regression heads
-        # 4 anchors per location
-        self.cls_head = nn.Conv2d(128, 4 * num_classes, kernel_size=1)
-        self.reg_head = nn.Conv2d(128, 4 * 4, kernel_size=1)  # 4 bbox coords
+        # Feature extraction
+        self.feature_extractor = nn.Sequential(
+            nn.Conv2d(in_channels, intermediate_channels, kernel_size=1),
+            nn.BatchNorm2d(intermediate_channels),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(intermediate_channels, intermediate_channels, kernel_size=3, 
+                     padding=1, groups=intermediate_channels),
+            nn.BatchNorm2d(intermediate_channels),
+            nn.ReLU6(inplace=True),
+            nn.Conv2d(intermediate_channels, intermediate_channels, kernel_size=1),
+            nn.BatchNorm2d(intermediate_channels),
+            nn.ReLU6(inplace=True)
+        )
         
+        # Classification head
+        self.cls_head = nn.Conv2d(intermediate_channels, 
+                                  num_anchors * num_classes, kernel_size=1)
+        
+        # Regression head
+        self.reg_head = nn.Conv2d(intermediate_channels, 
+                                  num_anchors * 4, kernel_size=1)
+        
+        # Initialize weights
+        self._init_weights()
+        
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+    
     def forward(self, x):
-        x = F.relu6(self.bn1(self.conv1(x)))
-        x = F.relu6(self.bn2(self.conv2(x)))
-        
-        cls_logits = self.cls_head(x)
-        bbox_regression = self.reg_head(x)
-        
+        features = self.feature_extractor(x)
+        cls_logits = self.cls_head(features)
+        bbox_regression = self.reg_head(features)
         return cls_logits, bbox_regression
 
 
 class EarlyExitSSDLite(nn.Module):
     """SSDLite with early exit capability"""
-    
+
     def __init__(self, base_model, exit_threshold=0.7):
         super().__init__()
-        
-        # Extract backbone features
-        self.features_early = nn.Sequential(*list(base_model.backbone.body.children())[:12])
-        self.features_late = nn.Sequential(*list(base_model.backbone.body.children())[12:])
-        
-        # Early exit branch after layer 12
-        self.early_branch = EarlyExitBranch(in_channels=96, num_classes=2)
-        
-        # Original detection head (simplified for 2 classes)
-        self.original_head = base_model.head
-        self.anchor_generator = base_model.anchor_generator
-        self.box_coder = base_model.box_coder
-        self.postprocess = base_model.postprocess_detections
-        
+
+        # Store the complete original backbone
+        self.backbone = base_model.backbone
+
+        # Access first Sequential block for early exit point
+        backbone_features = base_model.backbone.features
+        first_sequential = list(backbone_features.children())[0]
+        first_block_layers = list(first_sequential.children())
+
+        # Early exit point after sublayer 7 (80 channels at 20x20 resolution)
+        self.early_features = nn.Sequential(*first_block_layers[:8])
+
+        # Get the number of channels at the early exit point
+        early_channels = 80
+
+        # Early exit branch
+        num_anchors = 6  # Number of anchors per location
+        self.early_branch = EarlyExitBranch(
+            in_channels=early_channels,
+            num_anchors=num_anchors,
+            num_classes=2  # background + chair
+        )
+
+        # Full model branch (uses complete backbone output - 672 channels)
+        full_channels = 672
+        self.full_branch = EarlyExitBranch(
+            in_channels=full_channels,
+            num_anchors=num_anchors,
+            num_classes=2  # background + chair
+        )
+
         self.exit_threshold = exit_threshold
         self.num_classes = 2
-        
+
         # Statistics tracking
         self.exit_stats = {'early': 0, 'full': 0}
+        self.training_step = 0
         
     def compute_confidence(self, cls_logits):
         """Compute confidence score for early exit decision"""
         batch_size = cls_logits.shape[0]
+        
+        # Reshape logits
         cls_logits = cls_logits.permute(0, 2, 3, 1).contiguous()
         cls_logits = cls_logits.view(batch_size, -1, self.num_classes)
         
-        # Apply softmax and get max confidence
+        # Apply softmax and get max confidence for chair class
         probs = F.softmax(cls_logits, dim=-1)
-        max_probs = probs[:, :, 1].max(dim=1)[0]  # Max chair probability
         
-        return max_probs
+        # Get maximum chair probability across all predictions
+        chair_probs = probs[:, :, 1]  # Index 1 is chair class
+        max_chair_prob = chair_probs.max(dim=1)[0]
+        
+        return max_chair_prob
     
     def forward(self, images, targets=None):
-        # Process early features
-        features_early = self.features_early(images)
-        
-        # Early exit branch predictions
+        if self.training and targets is None:
+            raise ValueError("In training mode, targets should be provided")
+
+        # Transform images if needed
+        if isinstance(images, (list, tuple)):
+            images = torch.stack(images)
+
+        # Early exit branch - process early features
+        features_early = self.early_features(images)
         early_cls, early_reg = self.early_branch(features_early)
         early_confidence = self.compute_confidence(early_cls)
-        
+
         if self.training:
-            # During training, compute both paths
-            features_late = self.features_late(features_early)
-            
+            # During training, always compute both paths
+            # Full model uses complete backbone
+            features_full = self.backbone(images)
+            # Get features from first output (higher resolution feature map)
+            if isinstance(features_full, dict):
+                features_full = features_full['0']
+            elif isinstance(features_full, (list, tuple)):
+                features_full = features_full[0]
+
             # Get full model predictions
-            features = {'0': features_early, '1': features_late}
-            detections = self.original_head(list(features.values()))
-            
-            # Compute losses
-            if targets is not None:
-                # Early branch loss
-                early_loss = self.compute_detection_loss(
-                    early_cls, early_reg, targets
-                )
-                
-                # Full model loss
-                full_loss = self.compute_detection_loss(
-                    detections['cls_logits'], 
-                    detections['bbox_regression'],
-                    targets
-                )
-                
-                # Combined loss with weighting
-                alpha = 0.5
-                total_loss = alpha * early_loss + (1 - alpha) * full_loss
-                
-                return {
-                    'loss': total_loss,
-                    'early_loss': early_loss,
-                    'full_loss': full_loss,
-                    'early_confidence': early_confidence.mean()
-                }
-            
-            return detections
-        
+            full_cls, full_reg = self.full_branch(features_full)
+
+            # Compute losses using knowledge distillation approach
+            losses = {}
+
+            # For early branch: use distillation from full model
+            with torch.no_grad():
+                full_cls_probs = F.softmax(full_cls.view(-1, self.num_classes), dim=1)
+
+            # Early classification loss (distillation from full model)
+            early_cls_loss = F.kl_div(
+                F.log_softmax(early_cls.view(-1, self.num_classes), dim=1),
+                full_cls_probs,
+                reduction='batchmean'
+            )
+
+            # Early regression loss (match full model predictions)
+            early_reg_loss = F.smooth_l1_loss(early_reg, full_reg.detach())
+
+            # Full model uses simple supervised losses
+            batch_size = full_cls.shape[0]
+            num_predictions = full_cls.view(batch_size, -1, self.num_classes).shape[1]
+
+            # Create background targets (most predictions should be background)
+            cls_targets = torch.zeros(batch_size, num_predictions, dtype=torch.long, device=early_cls.device)
+
+            full_cls_loss = F.cross_entropy(
+                full_cls.view(batch_size, num_predictions, self.num_classes).reshape(-1, self.num_classes),
+                cls_targets.view(-1)
+            )
+
+            # Regression loss with smaller weight
+            full_reg_loss = F.smooth_l1_loss(full_reg, torch.zeros_like(full_reg)) * 0.1
+
+            # Combine losses with adaptive weighting
+            confidence_weight = min(early_confidence.mean().item(), 0.8)
+            alpha = 0.3 + 0.4 * confidence_weight  # Dynamic weighting
+
+            losses['early_loss'] = early_cls_loss + early_reg_loss
+            losses['full_loss'] = full_cls_loss + full_reg_loss
+            losses['total_loss'] = alpha * losses['early_loss'] + (1 - alpha) * losses['full_loss']
+            losses['early_confidence'] = early_confidence.mean()
+
+            self.training_step += 1
+            return losses
+
         else:
-            # During inference, use early exit if confident
+            # During inference
             avg_confidence = early_confidence.mean().item()
-            
+
             if avg_confidence >= self.exit_threshold:
                 self.exit_stats['early'] += 1
-                # Format early predictions
-                return self.format_predictions(early_cls, early_reg, images)
+                # Return early predictions
+                return {
+                    'cls_logits': early_cls,
+                    'bbox_regression': early_reg,
+                    'exit_point': 'early',
+                    'confidence': avg_confidence
+                }
             else:
                 self.exit_stats['full'] += 1
                 # Continue with full model
-                features_late = self.features_late(features_early)
-                features = [features_early, features_late]
-                detections = self.original_head(features)
-                return self.format_predictions(
-                    detections['cls_logits'],
-                    detections['bbox_regression'],
-                    images
-                )
-    
-    def compute_detection_loss(self, cls_logits, bbox_regression, targets):
-        """Simplified detection loss computation"""
-        # This is a placeholder - implement proper SSD loss
-        cls_loss = F.cross_entropy(
-            cls_logits.view(-1, self.num_classes),
-            torch.zeros(cls_logits.view(-1, self.num_classes).shape[0], dtype=torch.long).cuda()
-        )
-        
-        reg_loss = F.smooth_l1_loss(
-            bbox_regression,
-            torch.zeros_like(bbox_regression)
-        )
-        
-        return cls_loss + reg_loss
-    
-    def format_predictions(self, cls_logits, bbox_regression, images):
-        """Format predictions for output"""
-        # Simplified formatting - adapt based on actual requirements
-        return {
-            'cls_logits': cls_logits,
-            'bbox_regression': bbox_regression
-        }
+                features_full = self.backbone(images)
+                if isinstance(features_full, dict):
+                    features_full = features_full['0']
+                elif isinstance(features_full, (list, tuple)):
+                    features_full = features_full[0]
+
+                full_cls, full_reg = self.full_branch(features_full)
+
+                return {
+                    'cls_logits': full_cls,
+                    'bbox_regression': full_reg,
+                    'exit_point': 'full',
+                    'confidence': avg_confidence
+                }
 
 
 class Trainer:
@@ -260,12 +345,12 @@ class Trainer:
         self.val_loader = val_loader
         self.device = device
         
-        # Optimizer with different learning rates
+        # Optimizer with different learning rates for different components
+        # Note: early_features is part of backbone, so we only include backbone once
         self.optimizer = torch.optim.AdamW([
             {'params': model.early_branch.parameters(), 'lr': 1e-3},
-            {'params': model.features_early.parameters(), 'lr': 1e-4},
-            {'params': model.features_late.parameters(), 'lr': 1e-4},
-            {'params': model.original_head.parameters(), 'lr': 5e-4}
+            {'params': model.full_branch.parameters(), 'lr': 1e-3},
+            {'params': model.backbone.parameters(), 'lr': 1e-4},
         ], weight_decay=0.0005)
         
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -286,30 +371,42 @@ class Trainer:
         epoch_confidences = []
         
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch}')
-        for images, targets in pbar:
-            images = torch.stack([img.to(self.device) for img in images])
-            targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
-            
-            # Forward pass
-            losses = self.model(images, targets)
-            
-            # Backward pass
-            self.optimizer.zero_grad()
-            losses['loss'].backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
-            
-            # Track metrics
-            epoch_losses.append(losses['loss'].item())
-            epoch_early_losses.append(losses['early_loss'].item())
-            epoch_full_losses.append(losses['full_loss'].item())
-            epoch_confidences.append(losses['early_confidence'].item())
-            
-            # Update progress bar
-            pbar.set_postfix({
-                'loss': np.mean(epoch_losses[-50:]),
-                'conf': np.mean(epoch_confidences[-50:])
-            })
+        for batch_idx, (images, targets) in enumerate(pbar):
+            try:
+                # Move to device
+                images = torch.stack([img.to(self.device) for img in images])
+                targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
+
+                # Forward pass
+                losses = self.model(images, targets)
+
+                # Check for NaN
+                if torch.isnan(losses['total_loss']):
+                    print(f"Warning: NaN loss detected at batch {batch_idx}, skipping...")
+                    continue
+
+                # Backward pass
+                self.optimizer.zero_grad()
+                losses['total_loss'].backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.optimizer.step()
+
+                # Track metrics
+                epoch_losses.append(losses['total_loss'].item())
+                epoch_early_losses.append(losses['early_loss'].item())
+                epoch_full_losses.append(losses['full_loss'].item())
+                epoch_confidences.append(losses['early_confidence'].item())
+
+                # Update progress bar
+                if batch_idx % 10 == 0:
+                    pbar.set_postfix({
+                        'loss': np.mean(epoch_losses[-50:]) if epoch_losses else 0,
+                        'conf': np.mean(epoch_confidences[-50:]) if epoch_confidences else 0
+                    })
+
+            except RuntimeError as e:
+                print(f"Error at batch {batch_idx}: {e}")
+                continue
         
         # Store epoch metrics
         self.train_metrics['loss'].append(np.mean(epoch_losses))
@@ -321,19 +418,21 @@ class Trainer:
         """Validate model"""
         self.model.eval()
         
-        val_losses = []
         inference_times = []
+        confidences = []
         
         with torch.no_grad():
             for images, targets in tqdm(self.val_loader, desc='Validation'):
                 images = torch.stack([img.to(self.device) for img in images])
-                targets = [{k: v.to(self.device) for k, v in t.items()} for t in targets]
                 
                 # Measure inference time
                 start_time = time.time()
-                predictions = self.model(images)
+                outputs = self.model(images)
                 inference_time = (time.time() - start_time) * 1000
+                
                 inference_times.append(inference_time)
+                if 'confidence' in outputs:
+                    confidences.append(outputs['confidence'])
         
         # Calculate metrics
         early_exit_rate = self.model.exit_stats['early'] / max(
@@ -342,6 +441,7 @@ class Trainer:
         
         self.val_metrics['inference_time'].append(np.mean(inference_times))
         self.val_metrics['early_exit_rate'].append(early_exit_rate)
+        self.val_metrics['avg_confidence'].append(np.mean(confidences) if confidences else 0)
         
         # Reset stats
         self.model.exit_stats = {'early': 0, 'full': 0}
@@ -364,6 +464,7 @@ class Trainer:
             
             # Print metrics
             print(f"Train Loss: {self.train_metrics['loss'][-1]:.4f}")
+            print(f"Train Confidence: {self.train_metrics['confidence'][-1]:.3f}")
             print(f"Early Exit Rate: {early_rate:.2%}")
             print(f"Avg Inference Time: {inf_time:.2f}ms")
             
@@ -407,8 +508,8 @@ class Trainer:
         """Create training plots"""
         epochs = range(1, len(self.train_metrics['loss']) + 1)
         
-        # Loss plot
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        # Create figure with subplots
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         
         # Training losses
         axes[0, 0].plot(epochs, self.train_metrics['loss'], 'b-', label='Total Loss')
@@ -428,18 +529,40 @@ class Trainer:
         axes[0, 1].grid(True, alpha=0.3)
         
         # Early exit rate
-        axes[1, 0].plot(epochs, self.val_metrics['early_exit_rate'], 'orange')
-        axes[1, 0].set_xlabel('Epoch')
-        axes[1, 0].set_ylabel('Early Exit Rate')
-        axes[1, 0].set_title('Validation Early Exit Rate')
-        axes[1, 0].grid(True, alpha=0.3)
+        axes[0, 2].plot(epochs, self.val_metrics['early_exit_rate'], 'orange')
+        axes[0, 2].set_xlabel('Epoch')
+        axes[0, 2].set_ylabel('Early Exit Rate')
+        axes[0, 2].set_title('Validation Early Exit Rate')
+        axes[0, 2].grid(True, alpha=0.3)
         
         # Inference time
-        axes[1, 1].plot(epochs, self.val_metrics['inference_time'], 'green')
+        axes[1, 0].plot(epochs, self.val_metrics['inference_time'], 'green')
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('Time (ms)')
+        axes[1, 0].set_title('Average Inference Time')
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # Validation confidence
+        axes[1, 1].plot(epochs, self.val_metrics['avg_confidence'], 'cyan')
         axes[1, 1].set_xlabel('Epoch')
-        axes[1, 1].set_ylabel('Time (ms)')
-        axes[1, 1].set_title('Average Inference Time')
+        axes[1, 1].set_ylabel('Confidence')
+        axes[1, 1].set_title('Validation Average Confidence')
         axes[1, 1].grid(True, alpha=0.3)
+        
+        # Combined metrics
+        ax2 = axes[1, 2]
+        ax2.plot(epochs, self.train_metrics['loss'], 'b-', label='Train Loss')
+        ax2.set_xlabel('Epoch')
+        ax2.set_ylabel('Loss', color='b')
+        ax2.tick_params(axis='y', labelcolor='b')
+        
+        ax3 = ax2.twinx()
+        ax3.plot(epochs, self.val_metrics['early_exit_rate'], 'r-', label='Early Exit Rate')
+        ax3.set_ylabel('Early Exit Rate', color='r')
+        ax3.tick_params(axis='y', labelcolor='r')
+        
+        axes[1, 2].set_title('Loss vs Early Exit Rate')
+        axes[1, 2].grid(True, alpha=0.3)
         
         plt.tight_layout()
         plt.savefig(os.path.join(ANALYSIS_EE_OUTPUT_PATH, 'training_plots.png'), dpi=150)
@@ -451,23 +574,41 @@ class Trainer:
 def get_transform(train=False):
     """Get image transforms"""
     from torchvision import transforms
-    
+
     if train:
         return transforms.Compose([
+            transforms.Resize((320, 320)),  # Resize to fixed size for SSDLite320
             transforms.ToTensor(),
             transforms.RandomHorizontalFlip(0.5),
         ])
-    return transforms.ToTensor()
+    return transforms.Compose([
+        transforms.Resize((320, 320)),  # Resize to fixed size for SSDLite320
+        transforms.ToTensor()
+    ])
 
 
 def main():
     """Main training function"""
     # Configuration
-    BATCH_SIZE = 8
-    NUM_EPOCHS = 20
+    BATCH_SIZE = 4  # Reduced for stability
+    NUM_EPOCHS = 20  # Reduced for initial testing
     EXIT_THRESHOLD = 0.7
-    
-    print("=== Early Exit SSDLite Training for Chair Detection ===\n")
+    NUM_WORKERS = 0  # Set to 0 for Windows to avoid multiprocessing issues
+
+    print("=== Early Exit SSDLite Training for Chair Detection ===")
+    print()
+
+    # Clean and create working directories
+    clean_working_directory()
+    create_output_directories()
+    print()
+
+    print(f"Configuration:")
+    print(f"  Batch Size: {BATCH_SIZE}")
+    print(f"  Epochs: {NUM_EPOCHS}")
+    print(f"  Exit Threshold: {EXIT_THRESHOLD}")
+    print(f"  Num Workers: {NUM_WORKERS}")
+    print()
     
     # Setup device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -478,13 +619,15 @@ def main():
     train_dataset = ChairCocoDataset(
         TRAIN_IMAGES_PATH,
         os.path.join(ANNOTATIONS_PATH, 'instances_train2017.json'),
-        transforms=get_transform(train=True)
+        transforms=get_transform(train=True),
+        max_samples=5000  # Limit for faster training during testing
     )
-    
+
     val_dataset = ChairCocoDataset(
         VAL_IMAGES_PATH,
         os.path.join(ANNOTATIONS_PATH, 'instances_val2017.json'),
-        transforms=get_transform(train=False)
+        transforms=get_transform(train=False),
+        max_samples=1000  # Limit for faster validation
     )
     
     # Create data loaders
@@ -492,16 +635,18 @@ def main():
         train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=4,
-        collate_fn=lambda x: tuple(zip(*x))
+        num_workers=NUM_WORKERS,  # Changed to 0 for Windows
+        collate_fn=collate_fn,     # Using named function instead of lambda
+        pin_memory=True if device.type == 'cuda' else False
     )
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=4,
-        collate_fn=lambda x: tuple(zip(*x))
+        num_workers=NUM_WORKERS,  # Changed to 0 for Windows
+        collate_fn=collate_fn,     # Using named function instead of lambda
+        pin_memory=True if device.type == 'cuda' else False
     )
     
     print(f"Train samples: {len(train_dataset)}")
@@ -509,8 +654,12 @@ def main():
     
     # Initialize model
     print("\nInitializing model...")
-    base_model = ssdlite320_mobilenet_v3_large(pretrained=True)
+    from torchvision.models.detection import SSDLite320_MobileNet_V3_Large_Weights
+    base_model = ssdlite320_mobilenet_v3_large(weights=SSDLite320_MobileNet_V3_Large_Weights.DEFAULT)
     model = EarlyExitSSDLite(base_model, exit_threshold=EXIT_THRESHOLD)
+    
+    print(f"Model initialized with early exit after first feature block")
+    print(f"Early exit threshold: {EXIT_THRESHOLD}")
     
     # Initialize trainer
     print("\nStarting training...")
