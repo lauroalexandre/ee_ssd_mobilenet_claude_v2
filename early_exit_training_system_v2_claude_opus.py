@@ -213,26 +213,46 @@ class EarlyExitSSDLite(nn.Module):
         self.exit_threshold = exit_threshold
         self.num_classes = 2
 
+        # Temperature parameter for confidence calibration
+        self.temperature = nn.Parameter(torch.ones(1) * 1.5)
+
         # Statistics tracking
         self.exit_stats = {'early': 0, 'full': 0}
         self.training_step = 0
-        
+
     def compute_confidence(self, cls_logits):
-        """Compute confidence score for early exit decision"""
+        """Compute confidence score using entropy-based approach with temperature scaling"""
         batch_size = cls_logits.shape[0]
-        
+
         # Reshape logits
         cls_logits = cls_logits.permute(0, 2, 3, 1).contiguous()
         cls_logits = cls_logits.view(batch_size, -1, self.num_classes)
-        
-        # Apply softmax and get max confidence for chair class
-        probs = F.softmax(cls_logits, dim=-1)
-        
-        # Get maximum chair probability across all predictions
-        chair_probs = probs[:, :, 1]  # Index 1 is chair class
-        max_chair_prob = chair_probs.max(dim=1)[0]
-        
-        return max_chair_prob
+
+        # Apply temperature scaling for better calibration
+        scaled_logits = cls_logits / self.temperature
+
+        # Apply softmax to get probabilities
+        probs = F.softmax(scaled_logits, dim=-1)
+
+        # Compute entropy for each prediction
+        # Higher entropy = more uncertainty = lower confidence
+        epsilon = 1e-10  # For numerical stability
+        entropy = -torch.sum(probs * torch.log(probs + epsilon), dim=-1)
+
+        # Normalize entropy to [0, 1] range
+        max_entropy = np.log(self.num_classes)  # Maximum possible entropy
+        normalized_entropy = entropy / max_entropy
+
+        # Convert entropy to confidence (1 - normalized_entropy)
+        # Low entropy (certain) = high confidence
+        # High entropy (uncertain) = low confidence
+        confidence_per_prediction = 1.0 - normalized_entropy
+
+        # Take mean confidence across all predictions for each sample
+        # This gives a more stable measure than just using max
+        mean_confidence = confidence_per_prediction.mean(dim=1)
+
+        return mean_confidence
     
     def forward(self, images, targets=None):
         if self.training and targets is None:
@@ -292,14 +312,49 @@ class EarlyExitSSDLite(nn.Module):
             # Regression loss with smaller weight
             full_reg_loss = F.smooth_l1_loss(full_reg, torch.zeros_like(full_reg)) * 0.1
 
-            # Combine losses with adaptive weighting
-            confidence_weight = min(early_confidence.mean().item(), 0.8)
-            alpha = 0.3 + 0.4 * confidence_weight  # Dynamic weighting
+            # Compute confidence diversity regularization
+            # Encourage variety in confidence scores (avoid all high or all low)
+            confidence_std = early_confidence.std()
+            target_std = 0.15  # Target standard deviation for confidence
+            diversity_loss = F.mse_loss(confidence_std, torch.tensor(target_std, device=early_confidence.device))
+
+            # Add penalty for early exits that differ from full model
+            # This encourages the early branch to only exit when it matches full model
+            early_full_agreement = F.kl_div(
+                F.log_softmax(early_cls.view(-1, self.num_classes), dim=1),
+                F.softmax(full_cls.view(-1, self.num_classes).detach(), dim=1),
+                reduction='batchmean'
+            )
+
+            # Improved loss weighting strategy
+            # Start with lower alpha (more full model) and increase over training
+            epoch_progress = min(self.training_step / 5000.0, 1.0)  # Gradually increase over 5000 steps
+
+            # Base alpha starts at 0.2 (favor full model) and can go up to 0.5
+            # But only if confidence is genuinely high
+            confidence_mean = early_confidence.mean().item()
+            base_alpha = 0.2 + 0.3 * epoch_progress
+
+            # Only increase alpha if confidence is above threshold
+            if confidence_mean >= self.exit_threshold:
+                alpha = min(base_alpha + 0.2, 0.6)  # Max 60% weight on early branch
+            else:
+                alpha = base_alpha  # Keep low weight if confidence is low
 
             losses['early_loss'] = early_cls_loss + early_reg_loss
             losses['full_loss'] = full_cls_loss + full_reg_loss
-            losses['total_loss'] = alpha * losses['early_loss'] + (1 - alpha) * losses['full_loss']
+            losses['diversity_loss'] = diversity_loss * 0.1  # Small weight for diversity
+            losses['agreement_loss'] = early_full_agreement * 0.05  # Small penalty for disagreement
+
+            # Total loss with all components
+            losses['total_loss'] = (
+                alpha * losses['early_loss'] +
+                (1 - alpha) * losses['full_loss'] +
+                losses['diversity_loss'] +
+                losses['agreement_loss']
+            )
             losses['early_confidence'] = early_confidence.mean()
+            losses['confidence_std'] = confidence_std
 
             self.training_step += 1
             return losses
@@ -351,6 +406,7 @@ class Trainer:
             {'params': model.early_branch.parameters(), 'lr': 1e-3},
             {'params': model.full_branch.parameters(), 'lr': 1e-3},
             {'params': model.backbone.parameters(), 'lr': 1e-4},
+            {'params': [model.temperature], 'lr': 1e-3},  # Temperature parameter
         ], weight_decay=0.0005)
         
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -364,12 +420,15 @@ class Trainer:
     def train_epoch(self, epoch):
         """Train for one epoch"""
         self.model.train()
-        
+
         epoch_losses = []
         epoch_early_losses = []
         epoch_full_losses = []
+        epoch_diversity_losses = []
+        epoch_agreement_losses = []
         epoch_confidences = []
-        
+        epoch_conf_stds = []
+
         pbar = tqdm(self.train_loader, desc=f'Epoch {epoch}')
         for batch_idx, (images, targets) in enumerate(pbar):
             try:
@@ -395,57 +454,74 @@ class Trainer:
                 epoch_losses.append(losses['total_loss'].item())
                 epoch_early_losses.append(losses['early_loss'].item())
                 epoch_full_losses.append(losses['full_loss'].item())
+                epoch_diversity_losses.append(losses['diversity_loss'].item())
+                epoch_agreement_losses.append(losses['agreement_loss'].item())
                 epoch_confidences.append(losses['early_confidence'].item())
+                epoch_conf_stds.append(losses['confidence_std'].item())
 
                 # Update progress bar
                 if batch_idx % 10 == 0:
                     pbar.set_postfix({
                         'loss': np.mean(epoch_losses[-50:]) if epoch_losses else 0,
-                        'conf': np.mean(epoch_confidences[-50:]) if epoch_confidences else 0
+                        'conf': np.mean(epoch_confidences[-50:]) if epoch_confidences else 0,
+                        'std': np.mean(epoch_conf_stds[-50:]) if epoch_conf_stds else 0,
+                        'temp': self.model.temperature.item()
                     })
 
             except RuntimeError as e:
                 print(f"Error at batch {batch_idx}: {e}")
                 continue
-        
+
         # Store epoch metrics
         self.train_metrics['loss'].append(np.mean(epoch_losses))
         self.train_metrics['early_loss'].append(np.mean(epoch_early_losses))
         self.train_metrics['full_loss'].append(np.mean(epoch_full_losses))
+        self.train_metrics['diversity_loss'].append(np.mean(epoch_diversity_losses))
+        self.train_metrics['agreement_loss'].append(np.mean(epoch_agreement_losses))
         self.train_metrics['confidence'].append(np.mean(epoch_confidences))
+        self.train_metrics['confidence_std'].append(np.mean(epoch_conf_stds))
         
     def validate(self, epoch):
         """Validate model"""
         self.model.eval()
-        
+
         inference_times = []
         confidences = []
-        
+        exit_points = {'early': 0, 'full': 0}
+
         with torch.no_grad():
             for images, targets in tqdm(self.val_loader, desc='Validation'):
                 images = torch.stack([img.to(self.device) for img in images])
-                
+
                 # Measure inference time
                 start_time = time.time()
                 outputs = self.model(images)
                 inference_time = (time.time() - start_time) * 1000
-                
+
                 inference_times.append(inference_time)
                 if 'confidence' in outputs:
                     confidences.append(outputs['confidence'])
-        
+
+                # Track exit points
+                if 'exit_point' in outputs:
+                    exit_points[outputs['exit_point']] += 1
+
         # Calculate metrics
-        early_exit_rate = self.model.exit_stats['early'] / max(
-            self.model.exit_stats['early'] + self.model.exit_stats['full'], 1
-        )
-        
+        total_samples = max(self.model.exit_stats['early'] + self.model.exit_stats['full'], 1)
+        early_exit_rate = self.model.exit_stats['early'] / total_samples
+
         self.val_metrics['inference_time'].append(np.mean(inference_times))
         self.val_metrics['early_exit_rate'].append(early_exit_rate)
         self.val_metrics['avg_confidence'].append(np.mean(confidences) if confidences else 0)
-        
+        self.val_metrics['confidence_std'].append(np.std(confidences) if confidences else 0)
+
+        # Store additional stats for analysis
+        self.val_metrics['early_count'] = self.model.exit_stats['early']
+        self.val_metrics['full_count'] = self.model.exit_stats['full']
+
         # Reset stats
         self.model.exit_stats = {'early': 0, 'full': 0}
-        
+
         return early_exit_rate, np.mean(inference_times)
     
     def train(self, num_epochs):
@@ -464,8 +540,12 @@ class Trainer:
             
             # Print metrics
             print(f"Train Loss: {self.train_metrics['loss'][-1]:.4f}")
-            print(f"Train Confidence: {self.train_metrics['confidence'][-1]:.3f}")
-            print(f"Early Exit Rate: {early_rate:.2%}")
+            print(f"  - Early Loss: {self.train_metrics['early_loss'][-1]:.4f}")
+            print(f"  - Full Loss: {self.train_metrics['full_loss'][-1]:.4f}")
+            print(f"  - Diversity Loss: {self.train_metrics['diversity_loss'][-1]:.4f}")
+            print(f"Train Confidence: {self.train_metrics['confidence'][-1]:.3f} (±{self.train_metrics['confidence_std'][-1]:.3f})")
+            print(f"Temperature: {self.model.temperature.item():.3f}")
+            print(f"Early Exit Rate: {early_rate:.2%} (Early: {self.val_metrics['early_count']}, Full: {self.val_metrics['full_count']})")
             print(f"Avg Inference Time: {inf_time:.2f}ms")
             
             # Save checkpoint
@@ -592,7 +672,7 @@ def main():
     # Configuration
     BATCH_SIZE = 4  # Reduced for stability
     NUM_EPOCHS = 20  # Reduced for initial testing
-    EXIT_THRESHOLD = 0.7
+    EXIT_THRESHOLD = 0.85  # Increased to force more full model usage
     NUM_WORKERS = 0  # Set to 0 for Windows to avoid multiprocessing issues
 
     print("=== Early Exit SSDLite Training for Chair Detection ===")
@@ -675,20 +755,31 @@ def main():
     # Final statistics
     final_metrics = {
         'final_train_loss': trainer.train_metrics['loss'][-1],
+        'final_early_loss': trainer.train_metrics['early_loss'][-1],
+        'final_full_loss': trainer.train_metrics['full_loss'][-1],
         'final_early_exit_rate': trainer.val_metrics['early_exit_rate'][-1],
         'final_inference_time': trainer.val_metrics['inference_time'][-1],
-        'avg_confidence': trainer.train_metrics['confidence'][-1]
+        'avg_confidence': trainer.train_metrics['confidence'][-1],
+        'confidence_std': trainer.train_metrics['confidence_std'][-1],
+        'final_temperature': model.temperature.item(),
+        'early_count': trainer.val_metrics['early_count'],
+        'full_count': trainer.val_metrics['full_count']
     }
-    
+
     # Save final summary
     with open(os.path.join(ANALYSIS_EE_OUTPUT_PATH, 'final_summary.json'), 'w') as f:
         json.dump(final_metrics, f, indent=4)
-    
+
     print("\nFinal Metrics:")
     print(f"  Train Loss: {final_metrics['final_train_loss']:.4f}")
+    print(f"    - Early Loss: {final_metrics['final_early_loss']:.4f}")
+    print(f"    - Full Loss: {final_metrics['final_full_loss']:.4f}")
     print(f"  Early Exit Rate: {final_metrics['final_early_exit_rate']:.2%}")
+    print(f"    - Early Exits: {final_metrics['early_count']}")
+    print(f"    - Full Model: {final_metrics['full_count']}")
     print(f"  Inference Time: {final_metrics['final_inference_time']:.2f}ms")
-    print(f"  Avg Confidence: {final_metrics['avg_confidence']:.3f}")
+    print(f"  Avg Confidence: {final_metrics['avg_confidence']:.3f} (±{final_metrics['confidence_std']:.3f})")
+    print(f"  Temperature: {final_metrics['final_temperature']:.3f}")
 
 
 if __name__ == "__main__":
