@@ -3,7 +3,8 @@
     "allow": [
       "Bash(python:*)",
       "Bash(timeout 120 python early_exit_training_system_v2_claude_opus.py)",
-      "Bash(timeout 180 python early_exit_training_system_v2_claude_opus.py)"
+      "Bash(timeout 180 python early_exit_training_system_v2_claude_opus.py)",
+      "Bash(timeout:*)"
     ],
     "deny": [],
     "ask": []

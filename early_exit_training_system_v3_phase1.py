@@ -247,11 +247,11 @@ class MultiLevelCascadeEarlyExitSSDLite(nn.Module):
         # Exit 1: After layer 7 (80 channels at 20x20 resolution)
         self.exit1_features = nn.Sequential(*first_block_layers[:8])
 
-        # Layers between exit 1 and exit 2 (layer 8-12)
-        self.mid_features = nn.Sequential(*first_block_layers[8:13])
+        # Layers between exit 1 and exit 2 (layer 8-11, outputs 112 channels)
+        self.mid_features = nn.Sequential(*first_block_layers[8:12])
 
-        # Remaining layers for full model (layer 13+)
-        self.late_features = nn.Sequential(*first_block_layers[13:])
+        # Remaining layers for full model (layer 12+, outputs 960 then reduced to 672)
+        self.late_features = nn.Sequential(*first_block_layers[12:])
 
         # Exit branches with enhanced architecture
         num_anchors = 6
@@ -265,12 +265,12 @@ class MultiLevelCascadeEarlyExitSSDLite(nn.Module):
             use_attention=True
         )
 
-        # Exit 2 branch: 160 channels -> 256 intermediate
+        # Exit 2 branch: 112 channels -> 224 intermediate
         # Also receives context from exit 1 (add small projection)
-        self.exit2_context_proj = nn.Conv2d(128, 160, kernel_size=1)
+        self.exit2_context_proj = nn.Conv2d(128, 112, kernel_size=1)
         self.exit2_branch = EnhancedEarlyExitBranch(
-            in_channels=160,
-            intermediate_channels=256,
+            in_channels=112,
+            intermediate_channels=224,
             num_anchors=num_anchors,
             num_classes=2,
             use_attention=True
@@ -278,7 +278,7 @@ class MultiLevelCascadeEarlyExitSSDLite(nn.Module):
 
         # Full branch: 672 channels
         # Receives context from exit 2 (add small projection)
-        self.full_context_proj = nn.Conv2d(256, 672, kernel_size=1)
+        self.full_context_proj = nn.Conv2d(224, 672, kernel_size=1)
         self.full_branch = EnhancedEarlyExitBranch(
             in_channels=672,
             intermediate_channels=512,
@@ -1023,8 +1023,8 @@ def main():
     )
 
     print("Architecture Details:")
-    print(f"  Exit 1: Layer 8 (80→128 channels) + SE Attention")
-    print(f"  Exit 2: Layer 12-14 (160→256 channels) + SE Attention")
+    print(f"  Exit 1: Layer 8 (80->128 channels) + SE Attention")
+    print(f"  Exit 2: Layer 12 (112->224 channels) + SE Attention")
     print(f"  Full:   Complete backbone (672 channels)")
     print(f"  Cascade: Each level refines previous predictions")
     print()
