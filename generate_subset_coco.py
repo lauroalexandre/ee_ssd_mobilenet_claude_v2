@@ -12,7 +12,7 @@ parser.add_argument("--category", required=True, help="COCO category name (e.g.,
 parser.add_argument("--val_images_path", default=r"D:\Download\JDownloader\MSCOCO\images\val2017", help="Path to COCO validation images")
 parser.add_argument("--val_annotations_path", default=r"D:\Download\JDownloader\MSCOCO\annotations\instances_val2017.json", help="Path to COCO annotation JSON file")
 parser.add_argument("--output_dir", default="subset_validation", help="Base output directory")
-parser.add_argument("--limit", type=int, default=100, help="Maximum number of images per group (single/crowd)")
+parser.add_argument("--limit", type=int, default=180, help="Maximum number of images per group (single/crowd)")
 parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
 
 args = parser.parse_args()
@@ -55,11 +55,19 @@ annotations = [ann for ann in coco_data["annotations"] if ann["category_id"] == 
 annotations_single = [ann for ann in annotations if not ann.get("iscrowd", 0)]
 annotations_crowd = [ann for ann in annotations if ann.get("iscrowd", 0)]
 
-# Shuffle and limit by --limit
-random.shuffle(annotations_single)
+# Shuffle and limit crowd annotations
 random.shuffle(annotations_crowd)
-annotations_single = annotations_single[:args.limit]
 annotations_crowd = annotations_crowd[:args.limit]
+
+# Get image IDs from the crowd subset to avoid duplicates
+crowd_image_ids = {ann["image_id"] for ann in annotations_crowd}
+
+# Filter single annotations to exclude images already in the crowd subset
+annotations_single = [ann for ann in annotations_single if ann["image_id"] not in crowd_image_ids]
+
+# Shuffle and limit single annotations
+random.shuffle(annotations_single)
+annotations_single = annotations_single[:args.limit]
 
 # Map images (id -> info)
 images_dict = {img["id"]: img for img in coco_data["images"]}
