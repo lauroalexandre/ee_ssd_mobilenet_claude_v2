@@ -549,7 +549,7 @@ class Trainer:
             print(f"Avg Inference Time: {inf_time:.2f}ms")
             
             # Save checkpoint
-            if (epoch + 1) % 5 == 0:
+            if (epoch + 1) % 25 == 0:
                 self.save_checkpoint(epoch + 1)
         
         # Save final model and metrics
@@ -679,7 +679,7 @@ def main():
     print()
 
     # Clean and create working directories
-    clean_working_directory()
+    # clean_working_directory()
     create_output_directories()
     print()
 
