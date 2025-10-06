@@ -1,17 +1,18 @@
-# early_exit_training_system_v3_phase1_5.py
-# Phase 1.5: Learnable Thresholds with Distribution Loss
+# early_exit_training_system_v3_phase1_6.py
+# Phase 1.6: Soft/Differentiable Thresholds with Sigmoid Approximation
 #
-# Key improvements from Phase 1.4:
-# - LEARNABLE THRESHOLDS: Thresholds are now trainable parameters (like temperature)
-# - DISTRIBUTION LOSS: Guides thresholds to achieve target exit distribution
-# - AUTOMATIC CALIBRATION: No manual threshold tuning - model learns optimal values
-# - Conservative initialization: Exit1=0.55, Exit2=0.65 (safe margins)
+# Key improvements from Phase 1.5:
+# - SOFT THRESHOLDS: Sigmoid approximation replaces hard comparisons (>=)
+# - GRADIENT FLOW: Fully differentiable - thresholds can actually learn!
+# - TEMPERATURE CONTROL: Adjustable sigmoid sharpness (soft → hard transition)
+# - Same architecture: Learnable thresholds + distribution loss
 #
-# Phase 1.4 Analysis Findings:
-# - Model confidence stable: Exit1=0.491, Exit2=0.514, Full=0.590
-# - Threshold 0.45 was TOO CLOSE to confidence 0.491 (100% early exit)
-# - Fixed thresholds are fragile - small changes cause dramatic shifts
-# - Solution: Make thresholds learnable with distribution loss guidance
+# Phase 1.5 Failure Analysis:
+# - Hard threshold comparison (>=) has NO GRADIENTS
+# - exit1_would_exit = (exit1_conf >= threshold).float() ← gradient = 0!
+# - Result: Thresholds stayed frozen at initialization (0.55, 0.65)
+# - Distribution loss was constant (0.1525) every epoch
+# - Solution: Replace with sigmoid for smooth, differentiable approximation
 
 import torch
 import torch.nn as nn
@@ -308,7 +309,7 @@ class EnhancedEarlyExitBranch(nn.Module):
 class MultiLevelCascadeEarlyExitSSDLite(nn.Module):
     """SSDLite with multi-level cascade early exit capability"""
 
-    def __init__(self, base_model, exit1_threshold=0.45, exit2_threshold=0.60):
+    def __init__(self, base_model, exit1_threshold=0.45, exit2_threshold=0.60, sigmoid_temperature=10.0):
         super().__init__()
 
         # Store the complete original backbone
@@ -362,10 +363,16 @@ class MultiLevelCascadeEarlyExitSSDLite(nn.Module):
             use_attention=True
         )
 
-        # PHASE 1.5: Learnable thresholds (trainable parameters)
+        # PHASE 1.6: Learnable thresholds (trainable parameters)
         # Initialize with conservative values to ensure balanced distribution
         self.exit1_threshold = nn.Parameter(torch.tensor(exit1_threshold))
         self.exit2_threshold = nn.Parameter(torch.tensor(exit2_threshold))
+
+        # PHASE 1.6: Sigmoid temperature for soft thresholding
+        # Higher temperature = sharper transition (closer to hard threshold)
+        # Lower temperature = softer transition (more gradual)
+        self.sigmoid_temperature = sigmoid_temperature
+
         self.num_classes = 2
 
         # Temperature parameters for confidence calibration (per exit)
@@ -817,18 +824,29 @@ class MultiLevelCascadeEarlyExitSSDLite(nn.Module):
         if exit2_conf.mean() > full_conf.mean():
             conf_diversity_loss += (exit2_conf.mean() - full_conf.mean())
 
-        # ========== PHASE 1.5: Distribution loss ==========
+        # ========== PHASE 1.6: SOFT/DIFFERENTIABLE Distribution loss ==========
         # Guide thresholds to achieve target exit distribution
         # Target: 30% Exit1, 25% Exit2, 45% Full (midpoints of desired ranges)
 
-        # Simulate which exit each sample would take based on current confidences
-        exit1_would_exit = (exit1_conf >= self.exit1_threshold).float()
-        exit2_would_exit = ((exit1_conf < self.exit1_threshold) &
-                           (exit2_conf >= self.exit2_threshold)).float()
+        # PHASE 1.6 FIX: Use SIGMOID for differentiable soft thresholding
+        # Instead of hard comparison: (conf >= threshold).float() [NO GRADIENT!]
+        # Use sigmoid: σ(temp * (conf - threshold)) [SMOOTH GRADIENT ✓]
 
-        # Calculate rates
-        simulated_exit1_rate = exit1_would_exit.mean()
-        simulated_exit2_rate = exit2_would_exit.mean()
+        # Soft probability that each sample would exit at exit1
+        # sigmoid(temp * (conf - thresh)) ≈ 0 when conf << thresh, ≈ 1 when conf >> thresh
+        exit1_would_exit_prob = torch.sigmoid(
+            self.sigmoid_temperature * (exit1_conf - self.exit1_threshold)
+        )
+
+        # Soft probability that each sample would exit at exit2
+        # Must not have exited at exit1, AND confidence exceeds exit2 threshold
+        exit2_would_exit_prob = (1 - exit1_would_exit_prob) * torch.sigmoid(
+            self.sigmoid_temperature * (exit2_conf - self.exit2_threshold)
+        )
+
+        # Calculate soft exit rates (now differentiable!)
+        simulated_exit1_rate = exit1_would_exit_prob.mean()
+        simulated_exit2_rate = exit2_would_exit_prob.mean()
 
         # Target distribution (midpoints)
         target_exit1_rate = 0.30  # 20-40% range
@@ -856,7 +874,7 @@ class MultiLevelCascadeEarlyExitSSDLite(nn.Module):
             alpha_full * full_loss +
             0.05 * cascade_loss +
             0.02 * conf_diversity_loss +
-            0.1 * distribution_loss  # PHASE 1.5: Distribution loss for threshold learning
+            0.1 * distribution_loss  # PHASE 1.6: Now with gradients!
         )
 
         return {
@@ -866,9 +884,9 @@ class MultiLevelCascadeEarlyExitSSDLite(nn.Module):
             'full_loss': full_loss,
             'cascade_loss': cascade_loss,
             'diversity_loss': conf_diversity_loss,
-            'distribution_loss': distribution_loss,  # PHASE 1.5
-            'simulated_exit1_rate': simulated_exit1_rate,  # PHASE 1.5
-            'simulated_exit2_rate': simulated_exit2_rate,  # PHASE 1.5
+            'distribution_loss': distribution_loss,  # PHASE 1.6: Now differentiable
+            'simulated_exit1_rate': simulated_exit1_rate,  # PHASE 1.6: Soft rate
+            'simulated_exit2_rate': simulated_exit2_rate,  # PHASE 1.6: Soft rate
             'exit1_confidence': exit1_conf.mean(),
             'exit2_confidence': exit2_conf.mean(),
             'full_confidence': full_conf.mean(),
@@ -887,14 +905,14 @@ class Trainer:
         self.device = device
 
         # Optimizer with different learning rates
-        # PHASE 1.5: Added learnable thresholds
+        # PHASE 1.6: Learnable thresholds with higher learning rate for faster adaptation
         self.optimizer = torch.optim.AdamW([
             {'params': model.exit1_branch.parameters(), 'lr': 1e-3},
             {'params': model.exit2_branch.parameters(), 'lr': 1e-3},
             {'params': model.full_branch.parameters(), 'lr': 1e-3},
             {'params': model.backbone.parameters(), 'lr': 1e-4},
             {'params': [model.temperature1, model.temperature2, model.temperature_full], 'lr': 1e-2},
-            {'params': [model.exit1_threshold, model.exit2_threshold], 'lr': 5e-3},  # PHASE 1.5: Learnable thresholds
+            {'params': [model.exit1_threshold, model.exit2_threshold], 'lr': 1e-2},  # PHASE 1.6: Higher LR
         ], weight_decay=0.0005)
 
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -943,9 +961,10 @@ class Trainer:
                         'loss': np.mean(epoch_metrics['total_loss'][-50:]),
                         'e1_conf': np.mean(epoch_metrics['exit1_confidence'][-50:]),
                         'e2_conf': np.mean(epoch_metrics['exit2_confidence'][-50:]),
-                        'th1': self.model.exit1_threshold.item(),  # PHASE 1.5: Show threshold
-                        'th2': self.model.exit2_threshold.item(),  # PHASE 1.5: Show threshold
-                        'e1_rate': np.mean(epoch_metrics['simulated_exit1_rate'][-50:])  # PHASE 1.5
+                        'th1': self.model.exit1_threshold.item(),  # PHASE 1.6: Show threshold
+                        'th2': self.model.exit2_threshold.item(),  # PHASE 1.6: Show threshold
+                        'e1_rate': np.mean(epoch_metrics['simulated_exit1_rate'][-50:]),  # PHASE 1.6
+                        'dist_loss': np.mean(epoch_metrics['distribution_loss'][-50:])  # PHASE 1.6
                     })
 
             except RuntimeError as e:
@@ -956,7 +975,7 @@ class Trainer:
         for key, values in epoch_metrics.items():
             self.train_metrics[key].append(np.mean(values))
 
-        # PHASE 1.5: Track threshold evolution
+        # PHASE 1.6: Track threshold evolution
         if 'exit1_threshold' not in self.train_metrics:
             self.train_metrics['exit1_threshold'] = []
             self.train_metrics['exit2_threshold'] = []
@@ -1042,18 +1061,19 @@ class Trainer:
             print(f"  Exit 2 Loss: {self.train_metrics['exit2_loss'][-1]:.4f}")
             print(f"  Full Loss: {self.train_metrics['full_loss'][-1]:.4f}")
             print(f"  Cascade Loss: {self.train_metrics['cascade_loss'][-1]:.4f}")
-            print(f"  Distribution Loss: {self.train_metrics['distribution_loss'][-1]:.4f}")  # PHASE 1.5
+            print(f"  Distribution Loss: {self.train_metrics['distribution_loss'][-1]:.4f}")  # PHASE 1.6
 
             print(f"\n--- Confidence Progression ---")
             print(f"  Exit 1: {self.train_metrics['exit1_confidence'][-1]:.3f} (±{self.train_metrics['confidence_std_exit1'][-1]:.3f})")
             print(f"  Exit 2: {self.train_metrics['exit2_confidence'][-1]:.3f} (±{self.train_metrics['confidence_std_exit2'][-1]:.3f})")
             print(f"  Full:   {self.train_metrics['full_confidence'][-1]:.3f}")
 
-            print(f"\n--- PHASE 1.5: Learnable Thresholds ---")
+            print(f"\n--- PHASE 1.6: Learnable Thresholds (Soft/Differentiable) ---")
             print(f"  Exit 1 Threshold: {self.model.exit1_threshold.item():.3f} (conf: {self.train_metrics['exit1_confidence'][-1]:.3f})")
             print(f"  Exit 2 Threshold: {self.model.exit2_threshold.item():.3f} (conf: {self.train_metrics['exit2_confidence'][-1]:.3f})")
+            print(f"  Sigmoid Temperature: {self.model.sigmoid_temperature:.1f} (controls soft→hard transition)")
 
-            print(f"\n--- PHASE 1.5: Simulated Exit Distribution (Training) ---")
+            print(f"\n--- PHASE 1.6: Simulated Exit Distribution (Soft Thresholding) ---")
             print(f"  Exit 1 Rate: {self.train_metrics['simulated_exit1_rate'][-1]:.2%} (target: 30%)")
             print(f"  Exit 2 Rate: {self.train_metrics['simulated_exit2_rate'][-1]:.2%} (target: 25%)")
             print(f"  Full Rate:   {1 - self.train_metrics['simulated_exit1_rate'][-1] - self.train_metrics['simulated_exit2_rate'][-1]:.2%} (target: 45%)")
@@ -1093,16 +1113,16 @@ class Trainer:
     def save_final_results(self):
         """Save final model and metrics"""
         # Save model
-        final_model_path = os.path.join(MODEL_OUTPUT_PATH, 'early_exit_ssdlite_phase1_5_final.pth')
+        final_model_path = os.path.join(MODEL_OUTPUT_PATH, 'early_exit_ssdlite_phase1_6_final.pth')
         torch.save(self.model.state_dict(), final_model_path)
         print(f"\nFinal model saved: {final_model_path}")
 
         # Save metrics to CSV
         train_df = pd.DataFrame(self.train_metrics)
-        train_df.to_csv(os.path.join(ANALYSIS_EE_OUTPUT_PATH, 'train_metrics_phase1_5.csv'), index=False)
+        train_df.to_csv(os.path.join(ANALYSIS_EE_OUTPUT_PATH, 'train_metrics_phase1_6.csv'), index=False)
 
         val_df = pd.DataFrame(self.val_metrics)
-        val_df.to_csv(os.path.join(ANALYSIS_EE_OUTPUT_PATH, 'val_metrics_phase1_5.csv'), index=False)
+        val_df.to_csv(os.path.join(ANALYSIS_EE_OUTPUT_PATH, 'val_metrics_phase1_6.csv'), index=False)
 
         # Create and save plots
         self.create_plots()
@@ -1148,11 +1168,11 @@ class Trainer:
         axes[0, 2].legend()
         axes[0, 2].grid(True, alpha=0.3)
 
-        # Row 2, Col 1: PHASE 1.5 - Distribution loss (for threshold learning)
+        # Row 2, Col 1: PHASE 1.6 - Distribution loss (for threshold learning)
         axes[1, 0].plot(epochs, self.train_metrics['distribution_loss'], 'purple', linewidth=2)
         axes[1, 0].set_xlabel('Epoch')
         axes[1, 0].set_ylabel('Distribution Loss')
-        axes[1, 0].set_title('PHASE 1.5: Distribution Loss (Threshold Learning)')
+        axes[1, 0].set_title('PHASE 1.6: Distribution Loss (Soft/Differentiable)')
         axes[1, 0].grid(True, alpha=0.3)
 
         # Row 2, Col 2: Inference time
@@ -1186,14 +1206,14 @@ class Trainer:
         axes[2, 0].legend()
         axes[2, 0].grid(True, alpha=0.3)
 
-        # Row 3, Col 2: PHASE 1.5 - Learnable Threshold Evolution
+        # Row 3, Col 2: PHASE 1.6 - Learnable Threshold Evolution (Soft)
         axes[2, 1].plot(epochs, self.train_metrics['exit1_threshold'], 'r-', label='Exit 1 Threshold', linewidth=2)
         axes[2, 1].plot(epochs, self.train_metrics['exit2_threshold'], 'g-', label='Exit 2 Threshold', linewidth=2)
         axes[2, 1].plot(epochs, self.train_metrics['exit1_confidence'], 'r--', label='Exit 1 Confidence', linewidth=1, alpha=0.6)
         axes[2, 1].plot(epochs, self.train_metrics['exit2_confidence'], 'g--', label='Exit 2 Confidence', linewidth=1, alpha=0.6)
         axes[2, 1].set_xlabel('Epoch')
         axes[2, 1].set_ylabel('Threshold / Confidence')
-        axes[2, 1].set_title('PHASE 1.5: Learned Thresholds vs Confidence')
+        axes[2, 1].set_title('PHASE 1.6: Learned Thresholds (Sigmoid) vs Confidence')
         axes[2, 1].legend()
         axes[2, 1].grid(True, alpha=0.3)
 
@@ -1213,7 +1233,7 @@ class Trainer:
         axes[2, 2].set_title('Loss vs Early Exit Rate')
 
         plt.tight_layout()
-        plt.savefig(os.path.join(ANALYSIS_EE_OUTPUT_PATH, 'training_plots_phase1_5.png'), dpi=150, bbox_inches='tight')
+        plt.savefig(os.path.join(ANALYSIS_EE_OUTPUT_PATH, 'training_plots_phase1_6.png'), dpi=150, bbox_inches='tight')
         plt.close()
 
         print(f"Plots saved to {ANALYSIS_EE_OUTPUT_PATH}")
@@ -1236,45 +1256,54 @@ def get_transform(train=False):
 
 
 def main():
-    """Main training function for Phase 1.5"""
+    """Main training function for Phase 1.6"""
     # Configuration
     BATCH_SIZE = 4
     NUM_EPOCHS = 20
-    # Phase 1.5: LEARNABLE THRESHOLDS with distribution loss guidance
-    # Conservative initialization - model will learn optimal values
-    EXIT1_THRESHOLD = 0.55  # Conservative start (margin above observed 0.491)
-    EXIT2_THRESHOLD = 0.65  # Conservative start (margin above observed 0.514)
+    # Phase 1.6: SOFT/DIFFERENTIABLE THRESHOLDS with sigmoid approximation
+    # Conservative initialization - model will learn optimal values via GRADIENT FLOW
+    EXIT1_THRESHOLD = 0.45  # Start moderate (between Phase 1.4's 0.45 and 1.5's 0.55)
+    EXIT2_THRESHOLD = 0.60  # Start moderate
+    SIGMOID_TEMPERATURE = 10.0  # Controls soft→hard transition (10 = fairly sharp but smooth)
     NUM_WORKERS = 0
 
     print("="*80)
-    print(" Phase 1.5: Learnable Thresholds with Distribution Loss")
+    print(" Phase 1.6: Soft/Differentiable Thresholds with Sigmoid Approximation")
     print("="*80)
     print()
     print("KEY INNOVATION:")
-    print("  🚀 THRESHOLDS ARE NOW LEARNABLE PARAMETERS (like temperature)")
-    print("  🎯 DISTRIBUTION LOSS guides thresholds to target exit rates")
-    print("  ⚙️  AUTOMATIC CALIBRATION - no manual threshold tuning needed")
+    print("  🚀 SIGMOID SOFT THRESHOLDING replaces hard comparisons")
+    print("  📈 FULLY DIFFERENTIABLE - thresholds can ACTUALLY LEARN!")
+    print("  🎯 DISTRIBUTION LOSS now has proper gradient flow")
+    print("  ⚙️  AUTOMATIC CALIBRATION via backpropagation")
     print("="*80)
     print()
-    print("IMPROVEMENTS FROM PHASE 1.4:")
-    print("  - Thresholds are nn.Parameter (trainable via backprop)")
-    print("  - Added distribution loss: penalizes deviation from target rates")
-    print("  - Conservative initialization: Exit1=0.55, Exit2=0.65")
-    print("  - Target distribution: 30% Exit1, 25% Exit2, 45% Full")
+    print("IMPROVEMENTS FROM PHASE 1.5:")
+    print("  - Replaced hard threshold: (conf >= thresh).float() [NO GRADIENT ❌]")
+    print("  - With soft threshold:     sigmoid(temp * (conf - thresh)) [GRADIENT ✓]")
+    print("  - Distribution loss now changes each epoch (not constant!)")
+    print("  - Thresholds will actually move during training")
+    print("  - Sigmoid temperature controls soft→hard transition")
     print("="*80)
     print()
-    print("PHASE 1.4 FAILURE ANALYSIS:")
-    print("  - Fixed threshold 0.45 was too close to confidence 0.491")
-    print("  - Result: 100% early exit (same problem as Phase 1.2)")
-    print("  - Fixed thresholds are fragile - tiny changes cause huge shifts")
-    print("  - Solution: Make thresholds LEARNABLE like temperature")
+    print("PHASE 1.5 FAILURE ANALYSIS:")
+    print("  - Hard comparison (>=) produces binary 0/1 with undefined gradient")
+    print("  - simulated_exit_rate was always 0.0 → dist_loss = constant 0.1525")
+    print("  - Thresholds stayed frozen: 0.550 and 0.650 (never moved)")
+    print("  - Result: 0% early exit (same as Phase 1.3)")
+    print("  - Solution: Sigmoid makes threshold comparison SMOOTH and DIFFERENTIABLE")
     print("="*80)
     print()
-    print("HOW IT WORKS:")
-    print("  1. Thresholds initialized conservatively (0.55, 0.65)")
-    print("  2. During training, gradients adjust thresholds via distribution loss")
-    print("  3. Distribution loss = (exit1_rate - 30%)² + (exit2_rate - 25%)²")
-    print("  4. Model learns optimal thresholds automatically")
+    print("HOW SIGMOID SOFT THRESHOLDING WORKS:")
+    print("  - Hard: exit = 1 if conf >= thresh else 0  [step function, no gradient]")
+    print(f"  - Soft: exit_prob = σ({SIGMOID_TEMPERATURE} * (conf - thresh))  [smooth, has gradient]")
+    print("  - When conf >> thresh: sigmoid ≈ 1.0 (likely exit)")
+    print("  - When conf << thresh: sigmoid ≈ 0.0 (unlikely exit)")
+    print("  - When conf ≈ thresh:  sigmoid ≈ 0.5 (uncertain)")
+    print("  - Temperature controls transition sharpness:")
+    print("    - temp=1: very soft/gradual transition")
+    print(f"    - temp={SIGMOID_TEMPERATURE}: fairly sharp but smooth (our choice)")
+    print("    - temp=100: nearly hard threshold")
     print("="*80)
     print()
 
@@ -1286,8 +1315,9 @@ def main():
     print(f"Configuration:")
     print(f"  Batch Size: {BATCH_SIZE}")
     print(f"  Epochs: {NUM_EPOCHS}")
-    print(f"  Exit 1 Threshold: {EXIT1_THRESHOLD} (layer 8)")
-    print(f"  Exit 2 Threshold: {EXIT2_THRESHOLD} (layer 12)")
+    print(f"  Exit 1 Threshold: {EXIT1_THRESHOLD} (layer 8) [LEARNABLE]")
+    print(f"  Exit 2 Threshold: {EXIT2_THRESHOLD} (layer 12) [LEARNABLE]")
+    print(f"  Sigmoid Temperature: {SIGMOID_TEMPERATURE} (soft→hard control)")
     print(f"  Num Workers: {NUM_WORKERS}")
     print()
 
@@ -1339,13 +1369,14 @@ def main():
     print()
 
     # Initialize model
-    print("Initializing Phase 1.5 model with LEARNABLE THRESHOLDS...")
+    print("Initializing Phase 1.6 model with SOFT/DIFFERENTIABLE THRESHOLDS...")
     from torchvision.models.detection import SSDLite320_MobileNet_V3_Large_Weights
     base_model = ssdlite320_mobilenet_v3_large(weights=SSDLite320_MobileNet_V3_Large_Weights.DEFAULT)
     model = MultiLevelCascadeEarlyExitSSDLite(
         base_model,
         exit1_threshold=EXIT1_THRESHOLD,
-        exit2_threshold=EXIT2_THRESHOLD
+        exit2_threshold=EXIT2_THRESHOLD,
+        sigmoid_temperature=SIGMOID_TEMPERATURE
     )
 
     print("Architecture Details:")
@@ -1353,7 +1384,7 @@ def main():
     print(f"  Exit 2: Layer 12 (112->224 channels) + SE Attention")
     print(f"  Full:   Complete backbone (672 channels)")
     print(f"  Cascade: Each level refines previous predictions")
-    print(f"  ⚡ NEW: Exit thresholds are LEARNABLE parameters")
+    print(f"  ⚡ NEW: Sigmoid soft thresholds (FULLY DIFFERENTIABLE)")
     print()
 
     # Count parameters
@@ -1372,7 +1403,7 @@ def main():
     trainer.train(NUM_EPOCHS)
 
     print("\n" + "="*80)
-    print(" Training Complete - Phase 1.5: Learnable Thresholds")
+    print(" Training Complete - Phase 1.6: Soft/Differentiable Thresholds")
     print("="*80)
     print(f"Models saved to: {MODEL_OUTPUT_PATH}")
     print(f"Analysis saved to: {ANALYSIS_EE_OUTPUT_PATH}")
@@ -1385,7 +1416,7 @@ def main():
         'final_exit2_loss': trainer.train_metrics['exit2_loss'][-1],
         'final_full_loss': trainer.train_metrics['full_loss'][-1],
         'final_cascade_loss': trainer.train_metrics['cascade_loss'][-1],
-        'final_distribution_loss': trainer.train_metrics['distribution_loss'][-1],  # PHASE 1.5
+        'final_distribution_loss': trainer.train_metrics['distribution_loss'][-1],  # PHASE 1.6
 
         'final_exit1_rate': trainer.val_metrics['exit1_rate'][-1],
         'final_exit2_rate': trainer.val_metrics['exit2_rate'][-1],
@@ -1398,17 +1429,18 @@ def main():
         'train_exit2_confidence': trainer.train_metrics['exit2_confidence'][-1],
         'train_full_confidence': trainer.train_metrics['full_confidence'][-1],
 
-        'simulated_exit1_rate': trainer.train_metrics['simulated_exit1_rate'][-1],  # PHASE 1.5
-        'simulated_exit2_rate': trainer.train_metrics['simulated_exit2_rate'][-1],  # PHASE 1.5
+        'simulated_exit1_rate': trainer.train_metrics['simulated_exit1_rate'][-1],  # PHASE 1.6: Soft rate
+        'simulated_exit2_rate': trainer.train_metrics['simulated_exit2_rate'][-1],  # PHASE 1.6: Soft rate
 
         'val_exit1_confidence': trainer.val_metrics['exit1_confidence'][-1],
         'val_exit2_confidence': trainer.val_metrics['exit2_confidence'][-1],
         'val_full_confidence': trainer.val_metrics['full_confidence'][-1],
 
-        'learned_exit1_threshold': model.exit1_threshold.item(),  # PHASE 1.5
-        'learned_exit2_threshold': model.exit2_threshold.item(),  # PHASE 1.5
-        'initial_exit1_threshold': EXIT1_THRESHOLD,  # PHASE 1.5
-        'initial_exit2_threshold': EXIT2_THRESHOLD,  # PHASE 1.5
+        'learned_exit1_threshold': model.exit1_threshold.item(),  # PHASE 1.6
+        'learned_exit2_threshold': model.exit2_threshold.item(),  # PHASE 1.6
+        'initial_exit1_threshold': EXIT1_THRESHOLD,  # PHASE 1.6
+        'initial_exit2_threshold': EXIT2_THRESHOLD,  # PHASE 1.6
+        'sigmoid_temperature': model.sigmoid_temperature,  # PHASE 1.6
 
         'temperature1': model.temperature1.item(),
         'temperature2': model.temperature2.item(),
@@ -1420,12 +1452,12 @@ def main():
     }
 
     # Save final summary
-    with open(os.path.join(ANALYSIS_EE_OUTPUT_PATH, 'final_summary_phase1_5.json'), 'w') as f:
+    with open(os.path.join(ANALYSIS_EE_OUTPUT_PATH, 'final_summary_phase1_6.json'), 'w') as f:
         json.dump(final_metrics, f, indent=4)
 
     # Print comprehensive summary
     print("="*80)
-    print(" PHASE 1.5 FINAL RESULTS: Learnable Thresholds")
+    print(" PHASE 1.6 FINAL RESULTS: Soft/Differentiable Thresholds")
     print("="*80)
     print()
 
@@ -1435,10 +1467,10 @@ def main():
     print(f"  Exit 2:       {final_metrics['final_exit2_loss']:.4f}")
     print(f"  Full:         {final_metrics['final_full_loss']:.4f}")
     print(f"  Cascade:      {final_metrics['final_cascade_loss']:.4f}")
-    print(f"  Distribution: {final_metrics['final_distribution_loss']:.4f}")  # PHASE 1.5
+    print(f"  Distribution: {final_metrics['final_distribution_loss']:.4f}")  # PHASE 1.6
     print()
 
-    print("--- PHASE 1.5: Learned Thresholds ---")
+    print("--- PHASE 1.6: Learned Thresholds (Sigmoid Soft) ---")
     print(f"  Exit 1 Threshold:")
     print(f"    Initial: {final_metrics['initial_exit1_threshold']:.3f}")
     print(f"    Learned: {final_metrics['learned_exit1_threshold']:.3f}")
@@ -1447,6 +1479,7 @@ def main():
     print(f"    Initial: {final_metrics['initial_exit2_threshold']:.3f}")
     print(f"    Learned: {final_metrics['learned_exit2_threshold']:.3f}")
     print(f"    Change:  {final_metrics['learned_exit2_threshold'] - final_metrics['initial_exit2_threshold']:.3f}")
+    print(f"  Sigmoid Temperature: {final_metrics['sigmoid_temperature']:.1f}")
     print()
 
     print("--- Exit Distribution (Validation) ---")
@@ -1468,7 +1501,7 @@ def main():
     print(f"    Full:    {final_metrics['val_full_confidence']:.3f}")
     print()
 
-    print("--- PHASE 1.5: Simulated Exit Distribution (Training) ---")
+    print("--- PHASE 1.6: Simulated Exit Distribution (Soft Thresholding) ---")
     print(f"  Exit 1 Rate: {final_metrics['simulated_exit1_rate']:.2%} (target: 30%)")
     print(f"  Exit 2 Rate: {final_metrics['simulated_exit2_rate']:.2%} (target: 25%)")
     print(f"  Full Rate:   {1 - final_metrics['simulated_exit1_rate'] - final_metrics['simulated_exit2_rate']:.2%} (target: 45%)")
@@ -1485,40 +1518,20 @@ def main():
     print()
 
     # Comparison with previous phases
-    phase1_3_early_exit_rate = 0.0  # 0% from Phase 1.3 (thresholds too high)
-    phase1_4_early_exit_rate = 1.0  # 100% from Phase 1.4 (threshold too close)
-    phase1_2_early_exit_rate = 1.0  # 100% from Phase 1.2 (thresholds too low)
-    baseline_early_exit_rate = 0.0759  # 7.59% from v2
-
     print("="*80)
     print(" COMPARISON WITH PREVIOUS PHASES")
     print("="*80)
-    print(f"  Baseline (v2) Early Exit Rate:  {baseline_early_exit_rate:.2%}")
-    print(f"  Phase 1.2 Early Exit Rate:      {phase1_2_early_exit_rate:.2%} (Fixed thresh 0.30/0.50 - TOO LOW)")
-    print(f"  Phase 1.3 Early Exit Rate:      {phase1_3_early_exit_rate:.2%} (Fixed thresh 0.65/0.80 - TOO HIGH)")
-    print(f"  Phase 1.4 Early Exit Rate:      {phase1_4_early_exit_rate:.2%} (Fixed thresh 0.45/0.60 - TOO CLOSE)")
-    print(f"  Phase 1.5 Early Exit Rate:      {final_metrics['final_combined_early_exit_rate']:.2%} (LEARNABLE - AUTOMATIC)")
+    print(f"  Phase 1.2: 100% early exit (fixed thresh 0.30/0.50 - TOO LOW)")
+    print(f"  Phase 1.3: 0% early exit (fixed thresh 0.65/0.80 - TOO HIGH)")
+    print(f"  Phase 1.4: 100% early exit (fixed thresh 0.45/0.60 - TOO CLOSE)")
+    print(f"  Phase 1.5: 0% early exit (learnable thresh 0.55/0.65 - NO GRADIENT)")
+    print(f"  Phase 1.6: {final_metrics['final_combined_early_exit_rate']:.2%} early exit (SOFT LEARNABLE - GRADIENT ✓)")
     print()
-    print("  PHASE 1.5 KEY INNOVATION:")
-    print("    🎯 Thresholds are LEARNED, not manually tuned")
-    print("    📊 Distribution loss guides learning")
+    print("  PHASE 1.6 KEY FIX:")
+    print("    🔧 Replaced hard threshold (>=) with sigmoid soft threshold")
+    print("    📊 Distribution loss now has proper gradients")
     print(f"    ⚙️  Exit 1 threshold: {final_metrics['initial_exit1_threshold']:.3f} → {final_metrics['learned_exit1_threshold']:.3f}")
     print(f"    ⚙️  Exit 2 threshold: {final_metrics['initial_exit2_threshold']:.3f} → {final_metrics['learned_exit2_threshold']:.3f}")
-    print()
-    print("  TARGET DISTRIBUTION:")
-    print("    Exit 1: 20-40% (easy cases with clear detections)")
-    print("    Exit 2: 20-30% (moderate difficulty cases)")
-    print("    Full:   30-60% (complex cases requiring full processing)")
-    print()
-    print(f"  ACTUAL DISTRIBUTION (Validation):")
-    print(f"    Exit 1: {final_metrics['final_exit1_rate']:.2%}")
-    print(f"    Exit 2: {final_metrics['final_exit2_rate']:.2%}")
-    print(f"    Full:   {final_metrics['final_full_rate']:.2%}")
-    print()
-    print(f"  SIMULATED DISTRIBUTION (Training - what model learned):")
-    print(f"    Exit 1: {final_metrics['simulated_exit1_rate']:.2%}")
-    print(f"    Exit 2: {final_metrics['simulated_exit2_rate']:.2%}")
-    print(f"    Full:   {1 - final_metrics['simulated_exit1_rate'] - final_metrics['simulated_exit2_rate']:.2%}")
     print("="*80)
 
 
