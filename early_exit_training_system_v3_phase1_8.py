@@ -915,6 +915,8 @@ class Trainer:
                 for key, value in losses.items():
                     if torch.is_tensor(value):
                         epoch_metrics[key].append(value.item())
+                    elif isinstance(value, (int, float)):
+                        epoch_metrics[key].append(value)
 
                 # Update progress bar
                 if batch_idx % 10 == 0:
@@ -1285,7 +1287,7 @@ def main():
     print(f"  Exit 1 Threshold: {EXIT1_THRESHOLD_START:.2f} -> {EXIT1_THRESHOLD_END:.2f} (HIGHER curriculum)")
     print(f"  Exit 2 Threshold: {EXIT2_THRESHOLD_START:.2f} -> {EXIT2_THRESHOLD_END:.2f} (HIGHER curriculum)")
     print(f"  Gumbel Temperature: {GUMBEL_TEMPERATURE}")
-    print(f"  Temperature Constraints: [{self.model.temp_min if 'self' in dir() else 0.5}, {self.model.temp_max if 'self' in dir() else 3.0}]")
+    print(f"  Temperature Constraints: [0.5, 3.0]")
     print(f"  Min Detections: {MIN_DETECTIONS}")
     print(f"  Foreground Threshold: {FG_THRESHOLD}")
     print(f"  Num Workers: {NUM_WORKERS}")
