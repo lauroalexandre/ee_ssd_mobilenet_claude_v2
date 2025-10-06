@@ -208,3 +208,5 @@ __marimo__/
 
 # Project 
 ./vs
+working/model_trained
+subset_validation/

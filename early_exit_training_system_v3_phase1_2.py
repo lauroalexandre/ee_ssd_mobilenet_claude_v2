@@ -1011,16 +1011,16 @@ class Trainer:
     def save_final_results(self):
         """Save final model and metrics"""
         # Save model
-        final_model_path = os.path.join(MODEL_OUTPUT_PATH, 'early_exit_ssdlite_phase1_final.pth')
+        final_model_path = os.path.join(MODEL_OUTPUT_PATH, 'early_exit_ssdlite_phase1_2_final.pth')
         torch.save(self.model.state_dict(), final_model_path)
         print(f"\nFinal model saved: {final_model_path}")
 
         # Save metrics to CSV
         train_df = pd.DataFrame(self.train_metrics)
-        train_df.to_csv(os.path.join(ANALYSIS_EE_OUTPUT_PATH, 'train_metrics_phase1.csv'), index=False)
+        train_df.to_csv(os.path.join(ANALYSIS_EE_OUTPUT_PATH, 'train_metrics_phase1_2.csv'), index=False)
 
         val_df = pd.DataFrame(self.val_metrics)
-        val_df.to_csv(os.path.join(ANALYSIS_EE_OUTPUT_PATH, 'val_metrics_phase1.csv'), index=False)
+        val_df.to_csv(os.path.join(ANALYSIS_EE_OUTPUT_PATH, 'val_metrics_phase1_2.csv'), index=False)
 
         # Create and save plots
         self.create_plots()
@@ -1134,7 +1134,7 @@ class Trainer:
         axes[2, 2].set_title('Loss vs Early Exit Rate')
 
         plt.tight_layout()
-        plt.savefig(os.path.join(ANALYSIS_EE_OUTPUT_PATH, 'training_plots_phase1.png'), dpi=150, bbox_inches='tight')
+        plt.savefig(os.path.join(ANALYSIS_EE_OUTPUT_PATH, 'training_plots_phase1_2.png'), dpi=150, bbox_inches='tight')
         plt.close()
 
         print(f"Plots saved to {ANALYSIS_EE_OUTPUT_PATH}")
@@ -1173,7 +1173,7 @@ def main():
     print()
 
     # Clean and create working directories
-    clean_working_directory()
+    # clean_working_directory()  # Disabled: do not clean working directory
     create_output_directories()
     print()
 
@@ -1304,7 +1304,7 @@ def main():
     }
 
     # Save final summary
-    with open(os.path.join(ANALYSIS_EE_OUTPUT_PATH, 'final_summary_phase1.json'), 'w') as f:
+    with open(os.path.join(ANALYSIS_EE_OUTPUT_PATH, 'final_summary_phase1_2.json'), 'w') as f:
         json.dump(final_metrics, f, indent=4)
 
     # Print comprehensive summary

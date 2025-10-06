@@ -1228,7 +1228,7 @@ def main():
     print()
 
     # Clean and create working directories
-    clean_working_directory()
+    # clean_working_directory()  # Disabled: do not clean working directory
     create_output_directories()
     print()
 
