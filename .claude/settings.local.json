@@ -7,7 +7,10 @@
       "Bash(timeout:*)",
       "Bash(dir:*)",
       "Bash(cp:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(for f in working/ee_analysis/final_summary_phase1_*.json)",
+      "Bash(cat:*)",
+      "Bash(done)"
     ],
     "deny": [],
     "ask": []
